@@ -1,0 +1,78 @@
+name: Scheduler CI Pipeline
+
+on:
+  # Allow the scheduler to be triggered manually for testing.
+  workflow_dispatch:
+
+  # Run the scheduler every 5 minutes.
+  schedule:
+    - cron: "*/5 * * * *"
+
+  # Also run when changes are merged/pushed to main.
+  # This is useful while developing the scheduler.
+  push:
+    branches:
+      - main
+
+permissions:
+  # Required for GitHub OIDC authentication with AWS.
+  id-token: write
+
+  # Required to checkout this repository.
+  contents: read
+
+jobs:
+  scheduler:
+    name: Scan for incoming jobs
+    runs-on: ubuntu-latest
+
+    steps:
+      # ---------------------------------------------------------------------
+      # Step 1: Checkout test-env2
+      # ---------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------------
+      # Step 2: Configure Python
+      # ---------------------------------------------------------------------
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # ---------------------------------------------------------------------
+      # Step 3: Display runtime versions
+      # ---------------------------------------------------------------------
+      - name: Check environment
+        run: |
+          python3 --version
+          aws --version
+
+      # ---------------------------------------------------------------------
+      # Step 4: Authenticate to AWS using GitHub OIDC.
+      #
+      # No permanent AWS access keys are stored in GitHub.
+      # GitHub obtains temporary AWS credentials by assuming the
+      # test-env2 IAM role through AWS STS.
+      # ---------------------------------------------------------------------
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::389821258260:role/test-env2-producer
+          aws-region: us-west-2
+
+      # ---------------------------------------------------------------------
+      # Step 5: Verify which AWS identity the workflow assumed.
+      # ---------------------------------------------------------------------
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      # ---------------------------------------------------------------------
+      # Step 6: Run the scheduler.
+      #
+      # scanner.py performs ONE scan of the S3 incoming/ prefix and exits.
+      # GitHub Actions provides the recurring 5-minute schedule.
+      # ---------------------------------------------------------------------
+      - name: Scan for incoming jobs
+        run: python3 scanner.py
