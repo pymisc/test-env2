@@ -3,23 +3,23 @@
 """
 scanner.py
 
-Polls a shared S3 bucket for an artifact manifest.
+Scans the shared S3 bucket for incoming artifact submissions.
 
-Workflow:
+The producer (test-env1) publishes submissions using:
 
-1. Check whether packagefile.yaml exists in the S3 bucket.
-2. If it does not exist, wait for the configured polling interval.
-3. If it exists, create a scheduling marker/job file under:
+    incoming/<job-id>/packagefile.bin
+    incoming/<job-id>/packagefile.yaml
 
-       s3://split-env-data/scheduling/scheduling-jobs
+The presence of packagefile.yaml indicates that the producer has
+finished publishing the submission.
 
-The polling interval is configurable through the POLL_INTERVAL_SECONDS
-environment variable. The default is 300 seconds (5 minutes).
+This script performs ONE scan and then exits.
+
+GitHub Actions is responsible for running this script periodically
+(every 5 minutes).
 """
 
-import os
 import subprocess
-import time
 from datetime import datetime, timezone
 
 
@@ -29,61 +29,106 @@ from datetime import datetime, timezone
 
 S3_BUCKET = "split-env-data"
 
-# File produced by test-env1.
-MANIFEST_KEY = "packagefile.yaml"
+# Prefix where test-env1 publishes new submissions.
+INCOMING_PREFIX = "incoming/"
 
-# Object to create after detecting the manifest.
-SCHEDULING_KEY = "scheduling/scheduling-jobs"
+# Manifest filename used as the submission-ready signal.
+MANIFEST_NAME = "packagefile.yaml"
 
-# Default polling interval = 5 minutes.
-POLL_INTERVAL_SECONDS = int(
-    os.getenv("POLL_INTERVAL_SECONDS", "300")
-)
+# Prefix where scheduling records will be created.
+SCHEDULING_PREFIX = "scheduling/"
+
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+
+def current_timestamp() -> str:
+    """Return the current UTC timestamp in ISO-8601 format."""
+
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ---------------------------------------------------------------------------
 # S3 operations
 # ---------------------------------------------------------------------------
 
-def manifest_exists() -> bool:
+def find_incoming_manifests() -> list[str]:
     """
-    Check whether packagefile.yaml exists in S3.
+    Find all packagefile.yaml manifests under the incoming/ prefix.
 
-    head-object checks object metadata without downloading the object.
+    Example returned object key:
+
+        incoming/<job-id>/packagefile.yaml
     """
 
     result = subprocess.run(
         [
             "aws",
             "s3api",
-            "head-object",
+            "list-objects-v2",
             "--bucket",
             S3_BUCKET,
-            "--key",
-            MANIFEST_KEY,
+            "--prefix",
+            INCOMING_PREFIX,
+            "--query",
+            f"Contents[?ends_with(Key, `{MANIFEST_NAME}`)].Key",
+            "--output",
+            "text",
         ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=True,
     )
 
-    return result.returncode == 0
+    output = result.stdout.strip()
+
+    if not output or output == "None":
+        return []
+
+    return output.split()
 
 
-def create_scheduling_job() -> None:
+def extract_job_id(manifest_key: str) -> str:
     """
-    Create the scheduling marker object in S3.
+    Extract the UUID job ID from an incoming manifest key.
 
-    S3 uses object key prefixes rather than traditional directories,
-    so writing scheduling/scheduling-jobs automatically creates the
-    scheduling/ hierarchy shown in the S3 console.
+    Example:
+
+        incoming/6f57c42b-953c-4db5-8564-c037c4ddc973/packagefile.yaml
+
+    becomes:
+
+        6f57c42b-953c-4db5-8564-c037c4ddc973
     """
 
-    timestamp = datetime.now(timezone.utc).isoformat()
+    parts = manifest_key.split("/")
+
+    return parts[-2]
+
+
+def create_scheduling_job(
+    job_id: str,
+    manifest_key: str,
+) -> None:
+    """
+    Create a scheduling object for the detected incoming job.
+
+    Example:
+
+        scheduling/<job-id>.yaml
+    """
+
+    scheduling_key = f"{SCHEDULING_PREFIX}{job_id}.yaml"
+
+    timestamp = current_timestamp()
 
     content = (
-        f"source_manifest: {MANIFEST_KEY}\n"
-        f"status: scheduled\n"
-        f"created_at: {timestamp}\n"
+        "job:\n"
+        f"  id: {job_id}\n"
+        "  status: scheduled\n"
+        f"  source_manifest: {manifest_key}\n"
+        f'  scheduled_at: "{timestamp}"\n'
     )
 
     subprocess.run(
@@ -92,7 +137,7 @@ def create_scheduling_job() -> None:
             "s3",
             "cp",
             "-",
-            f"s3://{S3_BUCKET}/{SCHEDULING_KEY}",
+            f"s3://{S3_BUCKET}/{scheduling_key}",
         ],
         input=content,
         text=True,
@@ -100,48 +145,118 @@ def create_scheduling_job() -> None:
     )
 
     print(
+        f"[{current_timestamp()}] "
         f"Scheduling job created: "
-        f"s3://{S3_BUCKET}/{SCHEDULING_KEY}"
+        f"s3://{S3_BUCKET}/{scheduling_key}"
     )
 
 
 # ---------------------------------------------------------------------------
-# Main polling loop
+# Main workflow
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    """Continuously poll S3 for the producer manifest."""
+    """
+    Scan S3 once for incoming submissions and then exit.
 
-    print("=" * 60)
+    GitHub Actions provides the recurring 5-minute schedule.
+    """
+
+    scan_start_time = current_timestamp()
+
+    print()
+    print("=" * 70)
     print("test-env2 S3 Scanner")
-    print("=" * 60)
-    print(f"S3 bucket      : s3://{S3_BUCKET}")
-    print(f"Watching for   : {MANIFEST_KEY}")
-    print(f"Polling every  : {POLL_INTERVAL_SECONDS} seconds")
+    print("=" * 70)
+    print(f"Scan started     : {scan_start_time}")
+    print(f"S3 bucket        : s3://{S3_BUCKET}")
+    print(f"Scanning prefix  : {INCOMING_PREFIX}")
+    print(f"Manifest pattern : */{MANIFEST_NAME}")
     print()
 
-    while True:
+    # -----------------------------------------------------------------------
+    # Step 1: Scan S3 for incoming manifests.
+    # -----------------------------------------------------------------------
 
+    print(
+        f"[{current_timestamp()}] "
+        "Starting scan for incoming jobs..."
+    )
+
+    manifests = find_incoming_manifests()
+
+    scan_complete_time = current_timestamp()
+
+    # -----------------------------------------------------------------------
+    # Step 2: Handle case where no jobs were found.
+    # -----------------------------------------------------------------------
+
+    if not manifests:
+        print()
         print(
-            f"[{datetime.now(timezone.utc).isoformat()}] "
-            f"Checking for {MANIFEST_KEY}..."
+            f"[{scan_complete_time}] "
+            "Scan completed: no incoming jobs found."
         )
 
-        if manifest_exists():
-
-            print(f"Detected manifest: {MANIFEST_KEY}")
-
-            create_scheduling_job()
-
-            print("Scheduling completed.")
-            break
-
+        print()
+        print("-" * 70)
         print(
-            f"Manifest not found. "
-            f"Checking again in {POLL_INTERVAL_SECONDS} seconds..."
+            "No work to process. Scanner is exiting normally."
+        )
+        print(
+            "GitHub Actions will start the next scan "
+            "on the next scheduled interval."
+        )
+        print("-" * 70)
+
+        return
+
+    # -----------------------------------------------------------------------
+    # Step 3: Process discovered jobs.
+    # -----------------------------------------------------------------------
+
+    print()
+    print(
+        f"[{scan_complete_time}] "
+        f"Scan completed: found {len(manifests)} incoming job(s)."
+    )
+
+    print()
+
+    for manifest_key in manifests:
+
+        job_id = extract_job_id(manifest_key)
+
+        print("-" * 70)
+        print(f"Job ID   : {job_id}")
+        print(f"Manifest : {manifest_key}")
+        print(
+            f"Detected : {current_timestamp()}"
         )
 
-        time.sleep(POLL_INTERVAL_SECONDS)
+        create_scheduling_job(
+            job_id=job_id,
+            manifest_key=manifest_key,
+        )
+
+    # -----------------------------------------------------------------------
+    # Final summary
+    # -----------------------------------------------------------------------
+
+    print()
+    print("=" * 70)
+    print("Scanner completed successfully.")
+    print("=" * 70)
+    print(f"Scan started     : {scan_start_time}")
+    print(f"Scan completed   : {current_timestamp()}")
+    print(f"Jobs discovered  : {len(manifests)}")
+    print()
+
+    print(
+        "Scanner is exiting normally. "
+        "GitHub Actions will start the next scan "
+        "on the next scheduled interval."
+    )
 
 
 # ---------------------------------------------------------------------------
